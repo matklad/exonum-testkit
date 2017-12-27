@@ -140,12 +140,11 @@ extern crate serde_json;
 use futures::Stream;
 use futures::executor::{self, Spawn};
 use futures::sync::mpsc;
-use iron::IronError;
+use iron::{IronError, Chain, Handler};
 use iron::headers::{ContentType, Headers};
 use iron::status::StatusClass;
 use iron_test::{request, response};
 use mount::Mount;
-use router::Router;
 use serde::{Deserialize, Serialize};
 
 use std::collections::BTreeMap;
@@ -157,7 +156,8 @@ use exonum::blockchain::{Blockchain, ConsensusConfig, GenesisConfig, Schema as C
 use exonum::crypto;
 use exonum::helpers::{Height, Round, ValidatorId};
 use exonum::messages::{Message, Precommit, Propose};
-use exonum::node::{ApiSender, ExternalMessage, State as NodeState, TransactionSend, TxPool};
+use exonum::node::{ApiSender, ExternalMessage, State as NodeState, TransactionSend, TxPool,
+                   NodeApiConfig, create_public_api_handler};
 use exonum::storage::{MemoryDB, Snapshot};
 
 #[macro_use]
@@ -399,6 +399,7 @@ pub struct TestKitBuilder {
     us: TestNode,
     validators: Vec<TestNode>,
     services: Vec<Box<Service>>,
+    api_config: NodeApiConfig,
 }
 
 impl fmt::Debug for TestKitBuilder {
@@ -425,6 +426,7 @@ impl TestKitBuilder {
             validators: vec![us.clone()],
             services: Vec::new(),
             us,
+            api_config: Default::default(),
         }
     }
 
@@ -435,6 +437,7 @@ impl TestKitBuilder {
             validators: vec![TestNode::new_validator(ValidatorId(0))],
             services: Vec::new(),
             us,
+            api_config: Default::default(),
         }
     }
 
@@ -460,6 +463,12 @@ impl TestKitBuilder {
         self
     }
 
+    /// Sets API configuration for all nodes
+    pub fn with_api_config(mut self, config: NodeApiConfig) -> Self {
+        self.api_config = config;
+        self
+    }
+
     /// Creates the testkit.
     pub fn create(self) -> TestKit {
         crypto::init();
@@ -469,6 +478,7 @@ impl TestKitBuilder {
                 us: self.us,
                 validators: self.validators,
             },
+            self.api_config,
         )
     }
 }
@@ -483,6 +493,7 @@ pub struct TestKit {
     api_sender: ApiSender,
     mempool: TxPool,
     cfg_proposal: Option<ConfigurationProposalState>,
+    api_config: NodeApiConfig,
 }
 
 impl fmt::Debug for TestKit {
@@ -497,7 +508,7 @@ impl fmt::Debug for TestKit {
 }
 
 impl TestKit {
-    fn assemble(services: Vec<Box<Service>>, network: TestNetwork) -> Self {
+    fn assemble(services: Vec<Box<Service>>, network: TestNetwork, api_config: NodeApiConfig) -> Self {
         let api_channel = mpsc::channel(1_000);
         let api_sender = ApiSender::new(api_channel.0.clone());
 
@@ -546,6 +557,7 @@ impl TestKit {
             network,
             mempool: Arc::clone(&mempool),
             cfg_proposal: None,
+            api_config,
         }
     }
 
@@ -1134,7 +1146,7 @@ impl ApiKind {
 /// API encapsulation for the testkit. Allows to execute and synchronously retrieve results
 /// for REST-ful endpoints of services.
 pub struct TestKitApi {
-    public_mount: Mount,
+    public_handler: Chain,
     private_mount: Mount,
     api_sender: ApiSender,
 }
@@ -1149,30 +1161,16 @@ impl TestKitApi {
     /// Creates a new instance of API.
     fn new(testkit: &TestKit) -> Self {
         use std::sync::Arc;
-        use exonum::api::{public, Api};
 
         let blockchain = &testkit.blockchain;
 
         TestKitApi {
-            public_mount: {
-                let mut mount = Mount::new();
-
-                let service_mount = testkit.public_api_mount();
-                mount.mount("api/services", service_mount);
-
-                let mut router = Router::new();
-                let pool = Arc::clone(&testkit.mempool);
-                let system_api = public::SystemApi::new(pool, blockchain.clone());
-                system_api.wire(&mut router);
-                mount.mount("api/system", router);
-
-                let mut router = Router::new();
-                let explorer_api = public::ExplorerApi::new(blockchain.clone());
-                explorer_api.wire(&mut router);
-                mount.mount("api/explorer", router);
-
-                mount
-            },
+            public_handler: create_public_api_handler(
+                testkit.public_api_mount(),
+                Arc::clone(&testkit.mempool),
+                blockchain.clone(),
+                &testkit.api_config,
+            ),
 
             private_mount: {
                 let mut mount = Mount::new();
@@ -1187,10 +1185,16 @@ impl TestKitApi {
         }
     }
 
+    /// Returns an url which you can use in `iron_test::request`
+    /// for low-level testing.
+    pub fn api_url(endpiont: &str) -> String {
+        format!("http://localhost:3000/{}", endpiont)
+    }
+
     /// Returns the mounting point for public APIs. Useful for intricate testing not covered
     /// by `get*` and `post*` functions.
-    pub fn public_mount(&self) -> &Mount {
-        &self.public_mount
+    pub fn public_handler(&self) -> &Chain {
+        &self.public_handler
     }
 
     /// Returns the mounting point for private APIs. Useful for intricate testing not covered
@@ -1206,8 +1210,9 @@ impl TestKitApi {
         );
     }
 
-    fn get_internal<D>(mount: &Mount, url: &str, expect_error: bool) -> D
+    fn get_internal<H, D>(mount: &H, endpoint: &str, expect_error: bool) -> D
     where
+        H: Handler,
         for<'de> D: Deserialize<'de>,
     {
         let status_class = if expect_error {
@@ -1216,7 +1221,7 @@ impl TestKitApi {
             StatusClass::Success
         };
 
-        let url = format!("http://localhost:3000/{}", url);
+        let url = Self::api_url(endpoint);
         let resp = request::get(&url, Headers::new(), mount);
         let resp = if expect_error {
             // Support either "normal" or erroneous responses.
@@ -1252,7 +1257,7 @@ impl TestKitApi {
         for<'de> D: Deserialize<'de>,
     {
         TestKitApi::get_internal(
-            &self.public_mount,
+            &self.public_handler,
             &format!("{}/{}", kind.into_prefix(), endpoint),
             false,
         )
@@ -1269,7 +1274,7 @@ impl TestKitApi {
         for<'de> D: Deserialize<'de>,
     {
         TestKitApi::get_internal(
-            &self.public_mount,
+            &self.public_handler,
             &format!("{}/{}", kind.into_prefix(), endpoint),
             false,
         )
@@ -1285,18 +1290,19 @@ impl TestKitApi {
         for<'de> D: Deserialize<'de>,
     {
         TestKitApi::get_internal(
-            &self.public_mount,
+            &self.public_handler,
             &format!("{}/{}", kind.into_prefix(), endpoint),
             true,
         )
     }
 
-    fn post_internal<T, D>(mount: &Mount, endpoint: &str, data: &T) -> D
+    fn post_internal<H, T, D>(mount: &H, endpoint: &str, data: &T) -> D
     where
+        H: Handler,
         T: Serialize,
         for<'de> D: Deserialize<'de>,
     {
-        let url = format!("http://localhost:3000/{}", endpoint);
+        let url = Self::api_url(endpoint);
         let resp = request::post(
             &url,
             {
@@ -1327,7 +1333,7 @@ impl TestKitApi {
         for<'de> D: Deserialize<'de>,
     {
         TestKitApi::post_internal(
-            &self.public_mount,
+            &self.public_handler,
             &format!("{}/{}", kind.into_prefix(), endpoint),
             transaction,
         )

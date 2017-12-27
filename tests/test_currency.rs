@@ -23,11 +23,17 @@ extern crate exonum;
 extern crate exonum_testkit;
 #[macro_use]
 extern crate serde_derive;
+extern crate iron;
+extern crate iron_test;
 
 use std::collections::BTreeSet;
 use std::iter::FromIterator;
 
+use iron::headers::{self, Headers};
+use iron_test::request;
+
 use exonum::crypto::{self, PublicKey, SecretKey};
+use exonum::node::{NodeApiConfig, AllowOrigin};
 use exonum::messages::Message;
 use exonum_testkit::{ApiKind, ComparableSnapshot, TestKit, TestKitApi, TestKitBuilder};
 
@@ -692,4 +698,23 @@ fn test_nonsigned_transaction_in_create_block() {
     assert_eq!(wallet.balance(), 90);
     let wallet = get_wallet(&api, tx_bob.pub_key());
     assert_eq!(wallet.balance(), 110);
+}
+
+#[test]
+fn test_cors() {
+    let api = TestKitBuilder::validator()
+        .with_validators(4)
+        .with_service(CurrencyService)
+        .with_api_config(NodeApiConfig {
+            allow_origin: Some(AllowOrigin::Any),
+            .. Default::default()
+        })
+        .create()
+        .api();
+    let url = TestKitApi::api_url("api/services/cryptocurrency/v1/wallets");
+    let mut headers = Headers::new();
+    headers.set(headers::Origin::new("http", "example.com", None));
+    let resp = request::get(&url, headers, api.public_handler()).unwrap();
+    let headers = resp.headers;
+    assert_eq!(headers.get(), Some(&headers::AccessControlAllowOrigin::Any));
 }
