@@ -18,8 +18,8 @@ extern crate router;
 extern crate serde;
 extern crate serde_json;
 
-use exonum::blockchain::{ApiContext, Blockchain, Service, Transaction};
-use exonum::node::{ApiSender, TransactionSend};
+use exonum::blockchain::{ApiContext, Blockchain, Service, Transaction, TransactionService, ObserverService};
+use exonum::node::ApiSender;
 use exonum::messages::{Message, RawTransaction};
 use exonum::storage::{Fork, MapIndex, Snapshot};
 use exonum::crypto::{Hash, PublicKey};
@@ -169,12 +169,6 @@ struct CryptocurrencyApi {
     blockchain: Blockchain,
 }
 
-/// The structure returned by the REST API.
-#[derive(Serialize, Deserialize)]
-pub struct TransactionResponse {
-    pub tx_hash: Hash,
-}
-
 /// Shortcut to get data on wallets.
 impl CryptocurrencyApi {
     fn wallet(&self, pub_key: &PublicKey) -> Option<Wallet> {
@@ -189,41 +183,6 @@ impl CryptocurrencyApi {
         let wallets = schema.wallets();
         let wallets = wallets.values();
         wallets.collect()
-    }
-
-    /// Endpoint for transactions.
-    fn post_transaction(&self, req: &mut Request) -> IronResult<Response> {
-        /// Add an enum which joins transactions of both types to simplify request
-        /// processing.
-        #[serde(untagged)]
-        #[derive(Clone, Serialize, Deserialize)]
-        enum TransactionRequest {
-            CreateWallet(TxCreateWallet),
-            Transfer(TxTransfer),
-        }
-
-        /// Implement a trait for the enum for deserialized `TransactionRequest`s
-        /// to fit into the node channel.
-        impl Into<Box<Transaction>> for TransactionRequest {
-            fn into(self) -> Box<Transaction> {
-                match self {
-                    TransactionRequest::CreateWallet(trans) => Box::new(trans),
-                    TransactionRequest::Transfer(trans) => Box::new(trans),
-                }
-            }
-        }
-
-        match req.get::<bodyparser::Struct<TransactionRequest>>() {
-            Ok(Some(transaction)) => {
-                let transaction: Box<Transaction> = transaction.into();
-                let tx_hash = transaction.hash();
-                self.channel.send(transaction).map_err(ApiError::from)?;
-                let json = TransactionResponse { tx_hash };
-                self.ok_response(&serde_json::to_value(&json).unwrap())
-            }
-            Ok(None) => Err(ApiError::IncorrectRequest("Empty request body".into()))?,
-            Err(e) => Err(ApiError::IncorrectRequest(Box::new(e)))?,
-        }
     }
 
     /// Endpoint for retrieving a single wallet.
@@ -259,18 +218,11 @@ impl CryptocurrencyApi {
 impl Api for CryptocurrencyApi {
     fn wire(&self, router: &mut Router) {
         let self_ = self.clone();
-        let post_transaction = move |req: &mut Request| self_.post_transaction(req);
         let self_ = self.clone();
         let get_wallets = move |req: &mut Request| self_.get_wallets(req);
         let self_ = self.clone();
         let get_wallet = move |req: &mut Request| self_.get_wallet(req);
 
-        // Bind the transaction handler to a specific route.
-        router.post(
-            "/v1/wallets/transaction",
-            post_transaction,
-            "post_transaction",
-        );
         router.get("/v1/wallets", get_wallets, "get_wallets");
         router.get("/v1/wallet/:pub_key", get_wallet, "get_wallet");
     }
@@ -281,42 +233,62 @@ impl Api for CryptocurrencyApi {
 /// Define the service.
 pub struct CurrencyService;
 
-/// Implement a `Service` trait for the service.
-impl Service for CurrencyService {
-    fn service_name(&self) -> &'static str {
-        "cryptocurrency"
+transaction_set! {
+    CurrencyTransactions {
+        TxTransfer, TxCreateWallet
     }
+}
 
-    fn state_hash(&self, _: &Snapshot) -> Vec<Hash> {
+impl TransactionService for CurrencyService {
+    const ID: u16 = SERVICE_ID;
+    const NAME: &'static str = "cryptocurrency";
+    type Transactions = CurrencyTransactions;
+
+    fn state_hash(&self, snapshot: &Snapshot) -> Vec<Hash> {
         Vec::new()
     }
 
-    fn service_id(&self) -> u16 {
-        SERVICE_ID
-    }
-
-    /// Implement a method to deserialize transactions coming to the node.
-    fn tx_from_raw(&self, raw: RawTransaction) -> Result<Box<Transaction>, encoding::Error> {
-        let trans: Box<Transaction> = match raw.message_type() {
-            TX_TRANSFER_ID => Box::new(TxTransfer::from_raw(raw)?),
-            TX_CREATE_WALLET_ID => Box::new(TxCreateWallet::from_raw(raw)?),
-            _ => {
-                return Err(encoding::Error::IncorrectMessageType {
-                    message_type: raw.message_type(),
-                });
-            }
-        };
-        Ok(trans)
-    }
-
     /// Create a REST `Handler` to process web requests to the node.
-    fn public_api_handler(&self, ctx: &ApiContext) -> Option<Box<Handler>> {
-        let mut router = Router::new();
+    fn wire_public_api(&self, router: &mut Router, ctx: &ApiContext) {
         let api = CryptocurrencyApi {
             channel: ctx.node_channel().clone(),
             blockchain: ctx.blockchain().clone(),
         };
-        api.wire(&mut router);
-        Some(Box::new(router))
+        api.wire(router);
+    }
+}
+
+pub struct WalletsService;
+
+impl ObserverService for WalletsService {
+    const ID: u16 = 2;
+    const NAME: &'static str = "wallets";
+
+    fn wire_public_api(&self, router: &mut Router, ctx: &ApiContext) {
+        #[derive(Clone)]
+        struct WalletsApi {
+            channel: ApiSender,
+            blockchain: Blockchain,
+        }
+
+        impl WalletsApi {
+            fn get_wallets(&self, _: &mut Request) -> IronResult<Response> {
+                self.ok_response(&serde_json::to_value(&Vec::<Wallet>::new()).unwrap())
+            }
+        };
+
+        impl Api for WalletsApi {
+            fn wire(&self, router: &mut Router) {
+                let self_ = self.clone();
+                let get_wallets = move |req: &mut Request| self_.get_wallets(req);
+                router.get("/v1/wallets", get_wallets, "get_wallets");
+            }
+        }
+
+        let api = WalletsApi {
+            channel: ctx.node_channel().clone(),
+            blockchain: ctx.blockchain().clone(),
+        };
+        api.wire(router);
     }
 }

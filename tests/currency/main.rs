@@ -30,15 +30,17 @@ use std::iter::FromIterator;
 use exonum::crypto::{self, PublicKey, SecretKey};
 use exonum::messages::Message;
 use exonum_testkit::{ApiKind, ComparableSnapshot, TestKit, TestKitApi, TestKitBuilder};
+use exonum::blockchain::{TransactionResponse, TransactionService, ObserverService};
 
 mod cryptocurrency;
-use cryptocurrency::{CurrencySchema, CurrencyService, TransactionResponse, TxCreateWallet,
+use cryptocurrency::{CurrencySchema, CurrencyService, WalletsService, TxCreateWallet,
                      TxTransfer, Wallet};
 
 fn init_testkit() -> TestKit {
     TestKitBuilder::validator()
         .with_validators(4)
-        .with_service(CurrencyService)
+        .with_service(CurrencyService.into_service()) // coherence :(
+        .with_service(WalletsService.into_service())
         .create()
 }
 
@@ -49,7 +51,7 @@ fn create_wallet(api: &TestKitApi, name: &str) -> (TxCreateWallet, SecretKey) {
 
     let tx_info: TransactionResponse = api.post(
         ApiKind::Service("cryptocurrency"),
-        "v1/wallets/transaction",
+        "transactions",
         &tx,
     );
     assert_eq!(tx_info.tx_hash, tx.hash());
@@ -60,7 +62,7 @@ fn create_wallet(api: &TestKitApi, name: &str) -> (TxCreateWallet, SecretKey) {
 fn transfer(api: &TestKitApi, tx: &TxTransfer) {
     let tx_info: TransactionResponse = api.post(
         ApiKind::Service("cryptocurrency"),
-        "v1/wallets/transaction",
+        "transactions",
         tx,
     );
     assert_eq!(tx_info.tx_hash, tx.hash());
@@ -304,7 +306,8 @@ fn test_transfers_in_single_block() {
 fn test_malformed_wallet_request() {
     let testkit = TestKitBuilder::validator()
         .with_validators(4)
-        .with_service(CurrencyService)
+        .with_service(CurrencyService.into_service()) // coherence :(
+        .with_service(WalletsService.into_service())
         .create();
     let api = testkit.api();
     let info: String = api.get_err(ApiKind::Service("cryptocurrency"), "v1/wallet/c0ffee");
