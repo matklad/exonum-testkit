@@ -18,7 +18,7 @@ extern crate bodyparser;
 extern crate iron;
 extern crate router;
 
-use exonum::blockchain::{ApiContext, Blockchain, Service, Transaction};
+use exonum::blockchain::{ApiContext, Blockchain, Service, Transaction, TransactionSet};
 use exonum::messages::{Message, RawTransaction};
 use exonum::node::{ApiSender, TransactionSend};
 use exonum::storage::{Entry, Fork, Snapshot};
@@ -31,7 +31,6 @@ use self::router::Router;
 use serde_json;
 
 const SERVICE_ID: u16 = 1;
-const TX_INCREMENT_ID: u16 = 1;
 
 // "correct horse battery staple" brainwallet pubkey in Ed25519 with SHA-256 digest
 pub const ADMIN_KEY: &str = "506f27b1b4c2403f2602d663a059b0262afd6a5bcda95a08dd96a4614a89f1b0";
@@ -74,13 +73,18 @@ impl<'a> CounterSchema<&'a mut Fork> {
 
 // // // // Transactions // // // //
 
-message! {
-    struct TxIncrement {
-        const TYPE = SERVICE_ID;
-        const ID = TX_INCREMENT_ID;
+transactions! {
+    const SERVICE_ID = SERVICE_ID;
 
-        author: &PublicKey,
-        by: u64,
+    CounterTransactions {
+        struct TxIncrement {
+            author: &PublicKey,
+            by: u64,
+        }
+
+        struct TxReset {
+            author: &PublicKey,
+        }
     }
 }
 
@@ -92,15 +96,6 @@ impl Transaction for TxIncrement {
     fn execute(&self, fork: &mut Fork) {
         let mut schema = CounterSchema::new(fork);
         schema.inc_count(self.by());
-    }
-}
-
-message! {
-    struct TxReset {
-        const TYPE = SERVICE_ID;
-        const ID = TX_INCREMENT_ID;
-
-        author: &PublicKey,
     }
 }
 
@@ -219,15 +214,8 @@ impl Service for CounterService {
 
     /// Implement a method to deserialize transactions coming to the node.
     fn tx_from_raw(&self, raw: RawTransaction) -> Result<Box<Transaction>, encoding::Error> {
-        let trans: Box<Transaction> = match raw.message_type() {
-            TX_INCREMENT_ID => Box::new(TxIncrement::from_raw(raw)?),
-            _ => {
-                return Err(encoding::Error::IncorrectMessageType {
-                    message_type: raw.message_type(),
-                });
-            }
-        };
-        Ok(trans)
+        let tx = CounterTransactions::tx_from_raw(raw)?;
+        Ok(tx.into())
     }
 
     /// Create a REST `Handler` to process web requests to the node.
